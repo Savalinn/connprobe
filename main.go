@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,16 +34,19 @@ const (
 
 // Result is one finished probe, written as a single JSON line.
 type Result struct {
-	Seq       uint64  `json:"seq"`
+	Round     uint64  `json:"round"` // probe round (cycle) number, starting at 1
 	Host      string  `json:"host"`
 	IP        string  `json:"ip"`
 	Port      int     `json:"port"`
-	Start     string  `json:"start"`      // RFC3339, microsecond precision, local TZ
-	StartUs   int64   `json:"start_us"`   // Unix epoch in microseconds
-	End       string  `json:"end"`        // when the outcome was known
-	Outcome   string  `json:"outcome"`    // success | closed | timeout | error
-	ElapsedMs float64 `json:"elapsed_ms"` // microsecond resolution
+	Start     string  `json:"start"`      // connect(2) issued; RFC3339, µs precision, local TZ
+	StartUs   int64   `json:"start_us"`   // the same instant as Unix epoch microseconds
+	End       string  `json:"end"`        // outcome known; RFC3339, µs precision, local TZ
+	EndUs     int64   `json:"end_us"`     // the same instant as Unix epoch microseconds
+	Outcome   string  `json:"outcome"`    // success | closed | timeout | unreachable | error
+	ElapsedMs float64 `json:"elapsed_ms"` // end - start on the monotonic clock
 	Error     string  `json:"error,omitempty"`
+
+	idx int // launch position within the round, breaks start time ties
 }
 
 const timeLayout = "2006-01-02T15:04:05.000000Z07:00"
@@ -140,7 +144,7 @@ func main() {
 
 	results := make(chan Result, 64)
 	writerDone := make(chan struct{})
-	go writeResults(f, results, !cfg.quiet, writerDone)
+	go writeResults(f, results, len(cfg.targets)*len(cfg.ports), !cfg.quiet, writerDone)
 
 	run(ctx, cfg.targets, cfg.ports, cfg.interval, cfg.timeout, cfg.count, results)
 
@@ -151,19 +155,17 @@ func main() {
 // target is one probed address; host is what was given on the command line.
 type target struct{ host, ip string }
 
-// run is the central timing loop. On every tick it starts one probe for every
-// host×port pair. It returns once the loop has stopped and every in-flight
-// probe has reported its result.
+// run is the central timing loop. Round 1 starts immediately, every further
+// round on the next tick; each round starts one probe for every host×port
+// pair. It returns once the loop has stopped and every in-flight probe has
+// reported its result.
 func run(ctx context.Context, targets []target, ports []int, interval, timeout time.Duration, count int, results chan<- Result) {
-	var (
-		wg  sync.WaitGroup
-		seq uint64
-	)
+	var wg sync.WaitGroup
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for round := 0; count == 0 || round < count; round++ {
-		if round > 0 {
+	for round := uint64(1); count == 0 || round <= uint64(count); round++ {
+		if round > 1 {
 			select {
 			case <-ctx.Done():
 				wg.Wait()
@@ -171,51 +173,79 @@ func run(ctx context.Context, targets []target, ports []int, interval, timeout t
 			case <-ticker.C:
 			}
 		}
+		idx := 0
 		for _, t := range targets {
 			for _, p := range ports {
-				seq++
 				wg.Add(1)
-				go func(seq uint64, t target, port int) {
+				go func(round uint64, idx int, t target, port int) {
 					defer wg.Done()
-					results <- probe(seq, t, port, timeout)
-				}(seq, t, p)
+					r := probe(t, port, timeout)
+					r.Round, r.idx = round, idx
+					results <- r
+				}(round, idx, t, p)
+				idx++
 			}
 		}
 	}
 	wg.Wait()
 }
 
-func probe(seq uint64, t target, port int, timeout time.Duration) Result {
+// probe makes one connection attempt.
+func probe(t target, port int, timeout time.Duration) Result {
 	addr := net.JoinHostPort(t.ip, strconv.Itoa(port))
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+
+	var start time.Time
+	d := net.Dialer{
+		Timeout: timeout,
+		// Control runs after the socket is created, right before connect(2),
+		// so start is the moment the SYN is handed to the kernel.
+		Control: func(string, string, syscall.RawConn) error {
+			start = time.Now()
+			return nil
+		},
+	}
+
+	before := time.Now()
+	conn, err := d.Dial("tcp", addr)
 	end := time.Now()
 	if conn != nil {
 		conn.Close()
 	}
+	if start.IsZero() {
+		// The socket could not even be created (e.g. no IPv6 support, file
+		// descriptor limit), so Control never ran.
+		start = before
+	}
 
 	r := Result{
-		Seq:       seq,
 		Host:      t.host,
 		IP:        t.ip,
 		Port:      port,
 		Start:     start.Format(timeLayout),
 		StartUs:   start.UnixMicro(),
 		End:       end.Format(timeLayout),
+		EndUs:     end.UnixMicro(),
 		ElapsedMs: float64(end.Sub(start).Microseconds()) / 1000,
 	}
+	r.Outcome, r.Error = classify(err)
+	return r
+}
+
+// classify maps a dial error to an outcome. The OS error message is kept for
+// every failure except closed and timeout, which are self-explanatory.
+func classify(err error) (outcome, msg string) {
 	switch {
 	case err == nil:
-		r.Outcome = "success"
+		return "success", ""
 	case errors.Is(err, syscall.ECONNREFUSED):
-		r.Outcome = "closed"
+		return "closed", ""
 	case isTimeout(err):
-		r.Outcome = "timeout"
+		return "timeout", ""
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "unreachable", err.Error()
 	default:
-		r.Outcome = "error"
-		r.Error = err.Error()
+		return "error", err.Error()
 	}
-	return r
 }
 
 func isTimeout(err error) bool {
@@ -224,15 +254,35 @@ func isTimeout(err error) bool {
 }
 
 // writeResults is the only writer of the log file, so lines never interleave.
-func writeResults(w io.Writer, results <-chan Result, echo bool, done chan<- struct{}) {
+// Probes finish in any order, so results are collected per round in a log
+// buffer. A round is written once all of its perRound results are in and
+// every earlier round has been written; its lines are sorted by start time.
+// The log is therefore always in start order.
+func writeResults(w io.Writer, results <-chan Result, perRound int, echo bool, done chan<- struct{}) {
 	defer close(done)
 	enc := json.NewEncoder(w)
+	pending := map[uint64][]Result{}
+	next := uint64(1)
 	for r := range results {
-		if err := enc.Encode(r); err != nil {
-			fmt.Fprintf(os.Stderr, "write log: %v\n", err)
-		}
-		if echo {
-			fmt.Printf("%s %-21s %-7s %8.3f ms\n", r.Start, net.JoinHostPort(r.IP, strconv.Itoa(r.Port)), r.Outcome, r.ElapsedMs)
+		pending[r.Round] = append(pending[r.Round], r)
+		for len(pending[next]) == perRound {
+			batch := pending[next]
+			delete(pending, next)
+			next++
+			sort.Slice(batch, func(i, j int) bool {
+				if batch[i].StartUs != batch[j].StartUs {
+					return batch[i].StartUs < batch[j].StartUs
+				}
+				return batch[i].idx < batch[j].idx
+			})
+			for _, r := range batch {
+				if err := enc.Encode(r); err != nil {
+					fmt.Fprintf(os.Stderr, "write log: %v\n", err)
+				}
+				if echo {
+					fmt.Printf("%6d %s %-21s %-11s %8.3f ms\n", r.Round, r.Start, net.JoinHostPort(r.IP, strconv.Itoa(r.Port)), r.Outcome, r.ElapsedMs)
+				}
+			}
 		}
 	}
 }

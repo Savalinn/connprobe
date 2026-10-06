@@ -11,10 +11,11 @@ to the same host behave over time.
 
 ```text
 $ connprobe -hosts 192.168.0.4,2001:db8::10 -ports 22,443 -interval 400 -timeout 1500 -log probe.log
-2026-10-06T21:56:39.683818+02:00 192.168.0.4:22        success    0.406 ms
-2026-10-06T21:56:39.683549+02:00 192.168.0.4:443       closed     0.542 ms
-2026-10-06T21:56:39.683758+02:00 [2001:db8::10]:22     success    1.314 ms
-2026-10-06T21:56:39.684111+02:00 [2001:db8::10]:443    timeout 1500.211 ms
+     1 2026-10-06T21:56:39.683518+02:00 192.168.0.4:22        success        0.406 ms
+     1 2026-10-06T21:56:39.683579+02:00 192.168.0.4:443       closed         0.142 ms
+     1 2026-10-06T21:56:39.683633+02:00 [2001:db8::10]:22     success        1.314 ms
+     1 2026-10-06T21:56:39.683701+02:00 [2001:db8::10]:443    timeout     1500.211 ms
+     2 2026-10-06T21:56:40.083522+02:00 192.168.0.4:22        success        0.398 ms
 ...
 ```
 
@@ -25,10 +26,17 @@ $ connprobe -hosts 192.168.0.4,2001:db8::10 -ports 22,443 -interval 400 -timeout
 - **One central clock** — a single ticker starts every round, so all targets
   share exactly the same schedule. Probes run concurrently; a slow or hanging
   target never delays the others or the next round.
-- **Four clear outcomes** — `success` (with the connect time), `closed`
-  (connection refused), `timeout`, and `error` (with the system error message).
-- **Microsecond timestamps** — both wall-clock (RFC 3339, local time zone) and
-  Unix epoch microseconds, so the log is easy to read *and* easy to process.
+- **Clear outcomes** — `success` (with the connect time), `closed`
+  (connection refused), `timeout`, `unreachable` (no route / ICMP
+  unreachable) and `error` (anything else), with the system error message
+  wherever it adds information.
+- **Microsecond timestamps for both ends of every attempt** — when the
+  connect was issued and when its outcome became known, each as wall-clock
+  time (RFC 3339, local time zone) and as Unix epoch microseconds, so the log
+  is easy to read *and* easy to process.
+- **Log in start order, grouped by round** — every line carries its round
+  (cycle) number; rounds are written in order, and within a round lines are
+  ordered by their start time, no matter in which order the attempts finish.
 - **Accurate durations** — elapsed time is measured on the monotonic clock and
   covers only the TCP connect; no DNS lookup happens inside a probe.
 - **Safe, append-only JSON Lines log** — a single writer owns the file, lines
@@ -101,45 +109,65 @@ nohup connprobe -hosts 10.0.0.5 -ports 5432 -interval 500 -count 1200 -quiet -lo
 
 ## Log format
 
-Every **finished** probe produces exactly one line ([JSON Lines](https://jsonlines.org/)):
+Every probe produces exactly one line ([JSON Lines](https://jsonlines.org/))
+once it has finished, and lines appear in **start order** (see
+[Ordering](#ordering)):
 
 ```json
-{"seq":3,"host":"2001:db8::10","ip":"2001:db8::10","port":22,"start":"2026-10-06T21:56:39.683758+02:00","start_us":1791316599683758,"end":"2026-10-06T21:56:39.685072+02:00","outcome":"success","elapsed_ms":1.314}
-{"seq":4,"host":"2001:db8::10","ip":"2001:db8::10","port":443,"start":"2026-10-06T21:56:39.684111+02:00","start_us":1791316599684111,"end":"2026-10-06T21:56:41.184322+02:00","outcome":"timeout","elapsed_ms":1500.211}
-{"seq":7,"host":"2001:db8::99","ip":"2001:db8::99","port":22,"start":"2026-10-06T21:56:40.684359+02:00","start_us":1791316600684359,"end":"2026-10-06T21:56:40.684382+02:00","outcome":"error","elapsed_ms":0.023,"error":"dial tcp [2001:db8::99]:22: connect: network is unreachable"}
+{"round":7,"host":"192.168.0.4","ip":"192.168.0.4","port":443,"start":"2026-10-06T21:56:39.683579+02:00","start_us":1791316599683579,"end":"2026-10-06T21:56:39.683721+02:00","end_us":1791316599683721,"outcome":"closed","elapsed_ms":0.142}
+{"round":7,"host":"2001:db8::10","ip":"2001:db8::10","port":22,"start":"2026-10-06T21:56:39.683633+02:00","start_us":1791316599683633,"end":"2026-10-06T21:56:39.684947+02:00","end_us":1791316599684947,"outcome":"success","elapsed_ms":1.314}
+{"round":7,"host":"2001:db8::10","ip":"2001:db8::10","port":443,"start":"2026-10-06T21:56:39.683701+02:00","start_us":1791316599683701,"end":"2026-10-06T21:56:41.183912+02:00","end_us":1791316601183912,"outcome":"timeout","elapsed_ms":1500.211}
+{"round":7,"host":"2001:db8::99","ip":"2001:db8::99","port":22,"start":"2026-10-06T21:56:39.683760+02:00","start_us":1791316599683760,"end":"2026-10-06T21:56:39.683783+02:00","end_us":1791316599683783,"outcome":"unreachable","elapsed_ms":0.023,"error":"dial tcp [2001:db8::99]:22: connect: network is unreachable"}
 ```
 
 | Field        | Type   | Meaning |
 |--------------|--------|---------|
-| `seq`        | int    | Sequence number of the attempt, assigned when it is started (unique per run). |
+| `round`      | int    | The round (cycle) the attempt belongs to, starting at 1. Round, `ip` and `port` together identify an attempt within a run. |
 | `host`       | string | The target exactly as given on the command line. |
 | `ip`         | string | The address actually connected to. |
 | `port`       | int    | Target port. |
-| `start`      | string | When the connect attempt started — RFC 3339, microsecond precision, local time zone. |
+| `start`      | string | When the attempt was started: taken right before the `connect(2)` system call — RFC 3339, microsecond precision, local time zone. |
 | `start_us`   | int    | The same instant as Unix epoch microseconds. |
-| `end`        | string | When the outcome became known. |
+| `end`        | string | When the outcome (`success`, `closed`, `timeout` or `error`) became known — same format as `start`. |
+| `end_us`     | int    | The same instant as Unix epoch microseconds. |
 | `outcome`    | string | `success`, `closed`, `timeout` or `error`. |
-| `elapsed_ms` | float  | Duration of the attempt in milliseconds, microsecond resolution. |
-| `error`      | string | Only for `error`: the operating-system error message. |
+| `elapsed_ms` | float  | `end` − `start` in milliseconds with microsecond resolution, measured on the monotonic clock. |
+| `error`      | string | For `unreachable` and `error`: the operating-system error message. |
 
 ### Outcomes
 
-| Outcome   | Meaning |
-|-----------|---------|
+| Outcome       | Meaning |
+|---------------|---------|
 | `success` | The TCP handshake completed. `elapsed_ms` is the connect time. The connection is closed immediately afterwards. |
 | `closed`  | The target actively refused the connection (TCP RST — usually "nothing listens on that port"). |
 | `timeout` | No answer within `-timeout`. Typical for filtered ports, dropped packets or a host that is down. |
-| `error`   | Any other failure, e.g. `network is unreachable`, `no route to host`, `permission denied`. See `error`. |
+| `unreachable` | The target cannot be reached: there is no route to it locally (`network is unreachable`), or a router or firewall answered with ICMP destination unreachable — including *administratively prohibited* (`no route to host`). The message tells the cases apart. |
+| `error`   | Any other failure, e.g. no usable source address for the address family, a local firewall rule (`operation not permitted`), or the open file limit. See `error`. |
+
+### Ordering
+
+Probes finish in any order — a refused connection is answered in
+microseconds, a timeout takes the full `-timeout` — but the log is always in
+**start order**. Finished results are collected per round in a log buffer:
+
+- a round is written only when **every** attempt of that round has an
+  outcome, and only after **every earlier round** has been written;
+- within the round, lines are sorted by their measured `start_us`.
+
+So `round` never decreases from one line to the next, and neither does
+`start_us`. The price is latency, not data: a line can appear in the log up
+to `-timeout` after its own attempt finished, because its round waits for
+its slowest attempt, and a round waits for the rounds before it. The buffer
+never holds more than the rounds currently in flight.
 
 ### Working with the log
 
-Lines are written in **completion order**, not start order, so a fast probe of
-a later round can precede a slow probe of an earlier one. Sort by `start_us`
-(or `seq`) when the order matters:
-
 ```bash
-# Chronological view
-jq -s 'sort_by(.start_us)[]' -c probe.log
+# Outcome changes only: one line per target whenever its state flips
+jq -c --slurp 'reduce .[] as $r ({last:{}, out:[]};
+         ($r.ip + ":" + ($r.port|tostring)) as $k
+         | if .last[$k] != $r.outcome then .out += [$r] | .last[$k] = $r.outcome else . end)
+       | .out[]' probe.log
 
 # Everything that was not a success
 jq -c 'select(.outcome != "success")' probe.log
@@ -215,22 +243,26 @@ loss becomes a clearly recognisable ~1 s connect, two consecutive losses a
             │                                            │
    round n: ├─ probe(ip1:p1) ─┐                          ├─ round n+1 ...
             ├─ probe(ip1:p2) ─┤   concurrent goroutines  │
-            ├─ probe(ip2:p1) ─┤   net.DialTimeout        │
+            ├─ probe(ip2:p1) ─┤                          │
             └─ probe(ip2:p2) ─┘                          │
-                     │
+                     │  (finish in any order)
                      ▼
-              results channel ──► single writer ──► JSON line in log (+ stdout)
+   results channel ──► log buffer (per round) ──► round complete and all earlier
+                                                  rounds written? ──► sort by start,
+                                                  JSON lines to log (+ stdout)
 ```
 
 1. Arguments are validated and every target is turned into a concrete IP once,
    at startup.
 2. The first round starts immediately; after that a single `time.Ticker`
    triggers each round.
-3. Each round launches one goroutine per address × port pair. Each goroutine
-   takes its own start timestamp right before the connect call, so `start`
-   reflects the real start of that particular attempt.
+3. Each round launches one goroutine per address × port pair, tagged with the
+   round number. The start timestamp is taken in a `net.Dialer` `Control`
+   hook, which runs after the socket has been created and immediately before
+   `connect(2)`; the end timestamp right after the dial returns.
 4. Results are sent to a channel drained by one writer goroutine, which owns
-   the log file.
+   the log file and writes complete rounds in order through the log buffer
+   (see [Ordering](#ordering)).
 5. On interrupt the loop stops, waits for every in-flight probe (at most
    `-timeout`), flushes the remaining results and exits.
 
@@ -263,12 +295,18 @@ on the data.
 - **Missed rounds are skipped, not caught up.** If the process is paused (e.g.
   `SIGSTOP`, VM suspend, heavy CPU starvation), Go's ticker drops the ticks it
   could not deliver. The schedule then continues, without any record of the
-  rounds that never ran — look for gaps in `start_us`.
+  rounds that never ran. Round numbers stay consecutive, so look for gaps in
+  `start_us` (consecutive rounds should start about `-interval` apart).
 - **Timestamp resolution is not timestamp accuracy.** Times are logged with
-  microsecond resolution, but they include goroutine scheduling latency (on an
-  idle machine typically a few to tens of microseconds). `start` and `end` are
+  microsecond resolution. `start` is taken immediately before `connect(2)`, so
+  it is very close to the SYN leaving the host. `end` is taken when the Go
+  runtime hands the result back, which adds the network poller's wake-up
+  latency (on an idle machine typically a few to tens of microseconds).
+  A packet capture gives the exact wire times. `start` and `end` are
   wall-clock times and follow NTP adjustments; `elapsed_ms` uses the monotonic
-  clock and does not.
+  clock and does not. If the wall clock is stepped backwards, `start_us` can
+  briefly decrease between rounds; the `round` number still reflects the true
+  order.
 - **No limit on concurrency.** With `-timeout` longer than `-interval` probes
   overlap; up to *hosts × ports × ⌈timeout / interval⌉* connection attempts can
   be in flight at once. A very large port list can therefore hit the open file
@@ -278,7 +316,11 @@ on the data.
 - **No log rotation.** The log is opened once and appended to; it is not
   reopened on `SIGHUP`. Use `copytruncate`-style rotation, or restart the tool.
   Writes are not `fsync`'ed — the last lines may be lost on a power failure.
-- **Lines are in completion order.** See [Working with the log](#working-with-the-log).
+- **Finished results are held back in memory.** Because of the start-order
+  guarantee a result can wait up to `-timeout` in the log buffer. A normal
+  shutdown (`Ctrl+C`, `SIGTERM`, `-count`) always writes everything, but a
+  hard kill (`SIGKILL`, crash, power loss) loses the results still waiting
+  there — at most those of the last `-timeout` period.
 - **Tested on Linux only.** Development and testing were done on Linux
   (including WSL2). It builds for macOS and Windows, but outcome
   classification relies on the platform's error codes — on Windows in
@@ -292,11 +334,13 @@ go vet ./...
 go test ./...
 ```
 
-The tests cover command-line parsing and validation, the `success` /
-`closed` / `timeout` classification, the JSON log format and timestamps, that
-every round probes every address × port pair, and that an interrupt stops the
-loop after the in-flight round. The IPv6 part of the round test uses `::1`, so it needs IPv6 enabled on
-the loopback interface.
+The tests cover command-line parsing and validation, the outcome
+classification (`success`, `closed`, `timeout`, `unreachable`, `error`), the
+JSON log format and timestamps, the log buffer (rounds written complete and in
+order, lines sorted by start time), that every round probes every address ×
+port pair exactly once, and that an interrupt stops the loop after the in-
+flight round. The IPv6 part of the round test uses `::1`, so it needs IPv6
+enabled on the loopback interface.
 
 ## License
 
