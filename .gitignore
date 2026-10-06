@@ -1,0 +1,7 @@
+# Build output
+/connprobe
+
+# Probe logs and packet captures from local runs
+*.log
+*.pcap
+*.pcap[0-9]*
